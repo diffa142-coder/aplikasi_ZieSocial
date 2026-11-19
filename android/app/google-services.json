@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "41772941271",
+    "project_id": "aplikais-ziesosial",
+    "storage_bucket": "aplikais-ziesosial.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:41772941271:android:4871da3492ca81450e1592",
+        "android_client_info": {
+          "package_name": "com.example.card_design"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDP_T7R6sNLldCefg0pU_O7jFWewtMhMOk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

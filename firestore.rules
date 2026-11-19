@@ -1,0 +1,529 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// This security rules file assumes the following data structures for ZieSocial:
+//
+// Collection: users
+// Document ID: {userId} (positive integer string matching data.id, e.g. "101")
+// Fields:
+//   - id: int (required, > 0, immutable, must equal int(userId))
+//   - username: string (required, 1..50 chars)
+//   - name: string (required, 1..100 chars)
+//   - avatar: string or null (optional/nullable, <= 500000 chars for base64/URL)
+//   - bio: string or null (optional/nullable, <= 500 chars)
+//   - is_verified: bool (required, immutable on client update)
+//   - fcm_token: string or null (optional/nullable, <= 512 chars)
+//   - updated_at: string or timestamp (required)
+//
+// Subcollection: users/{userId}/notifications
+// Document ID: {notificationId} (non-empty string, 1..128 chars)
+// Fields:
+//   - id: int (required, > 0, immutable)
+//   - recipient_id: int (required, > 0, must equal int(userId), immutable)
+//   - actor_id: int (required, > 0, != recipient_id, immutable)
+//   - actor_username: string (required, 1..50 chars, immutable)
+//   - actor_name: string (required, 1..100 chars, immutable)
+//   - actor_avatar: string or null (optional/nullable, <= 500000 chars, immutable)
+//   - type: string (required, in ['like', 'comment', 'follow', 'message', 'reply', 'mention', 'reaction'], immutable)
+//   - body: string (required, 1..300 chars, immutable)
+//   - post_id: int or null (optional/nullable, > 0 when non-null, immutable)
+//   - chat_partner_id: int or null (optional/nullable, > 0 when non-null, immutable)
+//   - created_at: string (required, 19..64 chars ISO-8601 date string, immutable)
+//   - is_read: bool (required, cannot transition from true back to false)
+//
+// Collection: chats
+// Document ID: {chatId} (non-empty string, 1..128 chars, e.g. "101_205")
+// Fields:
+//   - participants: list of 2 distinct positive ints (required, immutable)
+//   - last_message: string (required, 0..2000 chars)
+//   - last_image_url: string or null (optional/nullable, <= 1000000 chars)
+//   - last_sender_id: int (required, > 0, must be in participants)
+//   - last_timestamp: string (required, ISO-8601 date string or empty, <= 64 chars)
+//   - updated_at: string or timestamp (required)
+//
+// Subcollection: chats/{chatId}/messages
+// Document ID: {messageId} (non-empty string, 1..128 chars)
+// Fields:
+//   - id: int (required, > 0, immutable)
+//   - sender_id: int (required, > 0, immutable, must be in parent chat participants)
+//   - receiver_id: int (required, > 0, immutable, must be in parent chat participants, != sender_id)
+//   - text: string (required, 0..2000 chars, immutable)
+//   - image_url: string or null (optional/nullable, <= 1000000 chars, immutable)
+//   - timestamp: string (required, ISO-8601 date string 19..64 chars, immutable)
+//   - is_read: bool (required, cannot transition from true back to false)
+//   - is_liked: bool (required)
+//   - reply_to_id: int or null (optional/nullable, > 0 when non-null, immutable)
+//   - reply_to_sender_name: string or null (optional/nullable, <= 100 chars, immutable)
+//   - reply_to_text: string or null (optional/nullable, <= 300 chars, immutable)
+//   - reaction: string or null (optional/nullable, <= 16 chars)
+//
+// Collection: stories
+// Document ID: {storyId} (non-empty string, 1..128 chars, e.g. numeric story ID)
+// Fields:
+//   - id: int (required, > 0, immutable)
+//   - author_id: int (required, > 0, immutable)
+//   - author_username: string (required, 1..50 chars, immutable)
+//   - author_name: string (required, 1..100 chars)
+//   - author_avatar: string or null (optional/nullable, <= 500000 chars)
+//   - author_verified: bool (optional, is bool when present)
+//   - media_url: string (required, 1..950000 chars, immutable)
+//   - caption: string or null (optional/nullable, <= 300 chars, immutable)
+//   - create_date: string (required, 19..64 chars ISO-8601 date string, immutable)
+//   - viewed_by: list of positive ints (required, size <= 500)
+//
+// SECURITY & AUTHENTICATION PROTOTYPE NOTICE:
+//   The app currently uses numeric PHP/local user IDs (int) without Firebase Auth
+//   configured (request.auth may be null). Therefore, these prototype rules enforce
+//   strict schema allowlists, type checks, string/list bounds, participant consistency,
+//   immutability, and safe delete/update constraints, while allowing unauthenticated
+//   SDK reads/creates/updates for compatibility during migration.
+//   BEFORE PRODUCTION: Enable Firebase Auth (Anonymous Auth at minimum, or ideally
+//   Firebase Custom Auth Tokens carrying a verified `app_user_id` claim) and gate
+//   all rules on `isAuthenticated()` and verified participant/owner identity.
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny at root
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if the request carries Firebase Auth credentials
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if the authenticated user has an admin custom claim
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.admin == true;
+    }
+
+    // Validate required fields exist
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Validate that the document contains only the allowed fields
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // Validate that immutable fields did not change on update
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Validate string length on request.resource.data
+    function validStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string &&
+             request.resource.data[field].size() >= minLen &&
+             request.resource.data[field].size() <= maxLen;
+    }
+
+    // Validate optional or nullable string with max length
+    function isValidNullableString(data, field, maxLen) {
+      return !(field in data) ||
+             data[field] == null ||
+             (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    // Validate optional or nullable positive int
+    function isValidNullablePositiveInt(data, field) {
+      return !(field in data) ||
+             data[field] == null ||
+             (data[field] is int && data[field] > 0);
+    }
+
+    // Validate ISO-8601 date/time string format (e.g. 2026-11-17T15:06:41.123456Z)
+    function isValidDateString(dateStr) {
+      return dateStr is string &&
+             dateStr.size() >= 19 &&
+             dateStr.size() <= 64 &&
+             dateStr.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}.*$');
+    }
+
+    // Validate updated_at as Firestore timestamp or bounded ISO-8601 date string
+    function isValidDateOrTimestamp(val) {
+      return val is timestamp || isValidDateString(val);
+    }
+
+    // Validate positive numeric document ID string (no leading zeros, max 19 digits)
+    function isValidNumericId(docId) {
+      return docId is string && docId.matches('^[1-9][0-9]{0,18}$');
+    }
+
+    // Validate generic document ID (non-empty, bounded, no slashes or whitespace)
+    function isValidDocId(docId) {
+      return docId is string &&
+             docId.size() >= 1 &&
+             docId.size() <= 128 &&
+             docId.matches('^[^/\\s]+$');
+    }
+
+    // Check parent chat existence after write (supports single writes and WriteBatch)
+    function chatExistsAfter(chatId) {
+      return existsAfter(/databases/$(database)/documents/chats/$(chatId));
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data, userId) {
+      return hasRequiredFields(['id', 'username', 'name', 'is_verified', 'updated_at']) &&
+             hasOnlyAllowedFields([
+               'id',
+               'username',
+               'name',
+               'avatar',
+               'bio',
+               'is_verified',
+               'fcm_token',
+               'updated_at'
+             ]) &&
+             data.id is int &&
+             data.id > 0 &&
+             int(userId) == data.id &&
+             validStringLength('username', 1, 50) &&
+             validStringLength('name', 1, 100) &&
+             isValidNullableString(data, 'avatar', 500000) &&
+             isValidNullableString(data, 'bio', 500) &&
+             data.is_verified is bool &&
+             isValidNullableString(data, 'fcm_token', 512) &&
+             isValidDateOrTimestamp(data.updated_at);
+    }
+
+    function isValidNotificationPayload(data, userId) {
+      return hasRequiredFields([
+               'id',
+               'recipient_id',
+               'actor_id',
+               'actor_username',
+               'actor_name',
+               'type',
+               'body',
+               'created_at',
+               'is_read'
+             ]) &&
+             hasOnlyAllowedFields([
+               'id',
+               'recipient_id',
+               'actor_id',
+               'actor_username',
+               'actor_name',
+               'actor_avatar',
+               'type',
+               'body',
+               'post_id',
+               'chat_partner_id',
+               'created_at',
+               'is_read'
+             ]) &&
+             data.id is int &&
+             data.id > 0 &&
+             data.recipient_id is int &&
+             data.recipient_id > 0 &&
+             int(userId) == data.recipient_id &&
+             data.actor_id is int &&
+             data.actor_id > 0 &&
+             data.actor_id != data.recipient_id &&
+             validStringLength('actor_username', 1, 50) &&
+             validStringLength('actor_name', 1, 100) &&
+             isValidNullableString(data, 'actor_avatar', 500000) &&
+             data.type is string &&
+             data.type in ['like', 'comment', 'follow', 'message', 'reply', 'mention', 'reaction'] &&
+             validStringLength('body', 1, 300) &&
+             isValidNullablePositiveInt(data, 'post_id') &&
+             isValidNullablePositiveInt(data, 'chat_partner_id') &&
+             isValidDateString(data.created_at) &&
+             data.is_read is bool;
+    }
+
+    function isValidNotificationUpdate(newData, oldData, userId) {
+      return isValidNotificationPayload(newData, userId) &&
+             areImmutableFieldsUnchanged([
+               'id',
+               'recipient_id',
+               'actor_id',
+               'actor_username',
+               'actor_name',
+               'actor_avatar',
+               'type',
+               'body',
+               'post_id',
+               'chat_partner_id',
+               'created_at'
+             ]) &&
+             newData.diff(oldData).affectedKeys().hasOnly(['is_read']) &&
+             (oldData.is_read == false || newData.is_read == true);
+    }
+
+    function isValidParticipantsList(participants) {
+      return participants is list &&
+             participants.size() == 2 &&
+             participants[0] is int &&
+             participants[0] > 0 &&
+             participants[1] is int &&
+             participants[1] > 0 &&
+             participants[0] != participants[1];
+    }
+
+    function isValidChat(data) {
+      return hasRequiredFields([
+               'participants',
+               'last_message',
+               'last_sender_id',
+               'last_timestamp',
+               'updated_at'
+             ]) &&
+             hasOnlyAllowedFields([
+               'participants',
+               'last_message',
+               'last_image_url',
+               'last_sender_id',
+               'last_timestamp',
+               'updated_at'
+             ]) &&
+             isValidParticipantsList(data.participants) &&
+             validStringLength('last_message', 0, 2000) &&
+             isValidNullableString(data, 'last_image_url', 1000000) &&
+             data.last_sender_id is int &&
+             data.last_sender_id > 0 &&
+             data.last_sender_id in data.participants &&
+             data.last_timestamp is string &&
+             data.last_timestamp.size() <= 64 &&
+             (data.last_timestamp.size() == 0 || isValidDateString(data.last_timestamp)) &&
+             isValidDateOrTimestamp(data.updated_at);
+    }
+
+    // Verify sender and receiver are the two participants of the parent chat
+    function isMessageParticipant(data, chatId) {
+      return chatExistsAfter(chatId) &&
+             data.sender_id in getAfter(/databases/$(database)/documents/chats/$(chatId)).data.participants &&
+             data.receiver_id in getAfter(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+    }
+
+    function isValidMessagePayload(data, chatId) {
+      return hasRequiredFields([
+               'id',
+               'sender_id',
+               'receiver_id',
+               'text',
+               'timestamp',
+               'is_read',
+               'is_liked'
+             ]) &&
+             hasOnlyAllowedFields([
+               'id',
+               'sender_id',
+               'receiver_id',
+               'text',
+               'image_url',
+               'timestamp',
+               'is_read',
+               'is_liked',
+               'reply_to_id',
+               'reply_to_sender_name',
+               'reply_to_text',
+               'reaction'
+             ]) &&
+             data.id is int &&
+             data.id > 0 &&
+             data.sender_id is int &&
+             data.sender_id > 0 &&
+             data.receiver_id is int &&
+             data.receiver_id > 0 &&
+             data.sender_id != data.receiver_id &&
+             isMessageParticipant(data, chatId) &&
+             validStringLength('text', 0, 2000) &&
+             isValidNullableString(data, 'image_url', 1000000) &&
+             (data.text.size() > 0 ||
+              ('image_url' in data && data.image_url is string && data.image_url.size() > 0)) &&
+             isValidDateString(data.timestamp) &&
+             data.is_read is bool &&
+             data.is_liked is bool &&
+             isValidNullablePositiveInt(data, 'reply_to_id') &&
+             isValidNullableString(data, 'reply_to_sender_name', 100) &&
+             isValidNullableString(data, 'reply_to_text', 300) &&
+             isValidNullableString(data, 'reaction', 16);
+    }
+
+    function isValidMessageUpdate(newData, oldData, chatId) {
+      return isValidMessagePayload(newData, chatId) &&
+             areImmutableFieldsUnchanged([
+               'id',
+               'sender_id',
+               'receiver_id',
+               'text',
+               'image_url',
+               'timestamp',
+               'reply_to_id',
+               'reply_to_sender_name',
+               'reply_to_text'
+             ]) &&
+             newData.diff(oldData).affectedKeys().hasOnly(['is_read', 'is_liked', 'reaction']) &&
+             (oldData.is_read == false || newData.is_read == true);
+    }
+
+    function isValidViewedByList(viewedBy) {
+      return viewedBy is list &&
+             viewedBy.size() <= 500 &&
+             (viewedBy.size() == 0 || (viewedBy[0] is int && viewedBy[0] > 0)) &&
+             (viewedBy.size() <= 1 || (viewedBy[viewedBy.size() - 1] is int && viewedBy[viewedBy.size() - 1] > 0));
+    }
+
+    function isValidStoryPayload(data) {
+      return hasRequiredFields([
+               'id',
+               'author_id',
+               'author_username',
+               'author_name',
+               'media_url',
+               'create_date',
+               'viewed_by'
+             ]) &&
+             hasOnlyAllowedFields([
+               'id',
+               'author_id',
+               'author_username',
+               'author_name',
+               'author_avatar',
+               'author_verified',
+               'media_url',
+               'caption',
+               'create_date',
+               'viewed_by'
+             ]) &&
+             data.id is int &&
+             data.id > 0 &&
+             data.author_id is int &&
+             data.author_id > 0 &&
+             validStringLength('author_username', 1, 50) &&
+             validStringLength('author_name', 1, 100) &&
+             isValidNullableString(data, 'author_avatar', 500000) &&
+             (!('author_verified' in data) || data.author_verified is bool) &&
+             validStringLength('media_url', 1, 950000) &&
+             isValidNullableString(data, 'caption', 300) &&
+             isValidDateString(data.create_date) &&
+             isValidViewedByList(data.viewed_by);
+    }
+
+    function isValidStoryUpdate(newData, oldData) {
+      return isValidStoryPayload(newData) &&
+             areImmutableFieldsUnchanged([
+               'id',
+               'author_id',
+               'author_username',
+               'media_url',
+               'caption',
+               'create_date'
+             ]) &&
+             newData.diff(oldData).affectedKeys().hasOnly([
+               'viewed_by',
+               'author_name',
+               'author_avatar',
+               'author_verified'
+             ]) &&
+             (!('viewed_by' in oldData) || newData.viewed_by.hasAll(oldData.viewed_by));
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // User directory (public non-PII profile fields only)
+    match /users/{userId} {
+      allow get: if isValidNumericId(userId);
+      allow list: if request.query.limit == null || request.query.limit <= 500;
+
+      allow create: if isValidNumericId(userId) &&
+                       isValidUser(request.resource.data, userId);
+
+      allow update: if isValidNumericId(userId) &&
+                       isValidUser(request.resource.data, userId) &&
+                       areImmutableFieldsUnchanged(['id']) &&
+                       (request.resource.data.is_verified == resource.data.is_verified || isAdmin());
+
+      // Prevent unauthenticated clients from deleting user directory profiles
+      allow delete: if isAdmin();
+
+      // In-app notifications subcollection for a user
+      match /notifications/{notificationId} {
+        allow get: if isValidNumericId(userId) && isValidDocId(notificationId);
+        allow list: if isValidNumericId(userId) &&
+                       (request.query.limit == null || request.query.limit <= 200);
+
+        allow create: if isValidNumericId(userId) &&
+                         isValidDocId(notificationId) &&
+                         isValidNotificationPayload(request.resource.data, userId);
+
+        allow update: if isValidNumericId(userId) &&
+                         isValidDocId(notificationId) &&
+                         isValidNotificationUpdate(request.resource.data, resource.data, userId);
+
+        // Allow users to clear notifications in their subcollection
+        allow delete: if isValidNumericId(userId) && isValidDocId(notificationId);
+      }
+    }
+
+    // Chat conversation threads
+    match /chats/{chatId} {
+      allow get: if isValidDocId(chatId);
+      allow list: if request.query.limit == null || request.query.limit <= 200;
+
+      allow create: if isValidDocId(chatId) &&
+                       isValidChat(request.resource.data);
+
+      allow update: if isValidDocId(chatId) &&
+                       isValidChat(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['participants']);
+
+      // Allow deleting conversation threads under the prototype numeric-ID compatibility model
+      // (matching `notifications` and `stories`). Before production, tighten to verified participants.
+      allow delete: if isValidDocId(chatId);
+
+      // Messages subcollection within a chat thread
+      match /messages/{messageId} {
+        allow get: if isValidDocId(chatId) && isValidDocId(messageId);
+        allow list: if isValidDocId(chatId) &&
+                       (request.query.limit == null || request.query.limit <= 500);
+
+        allow create: if isValidDocId(chatId) &&
+                         isValidDocId(messageId) &&
+                         isValidMessagePayload(request.resource.data, chatId);
+
+        allow update: if isValidDocId(chatId) &&
+                         isValidDocId(messageId) &&
+                         isValidMessageUpdate(request.resource.data, resource.data, chatId);
+
+        // Allow deleting messages (Unsend) under the same prototype numeric-ID compatibility
+        // model as `notifications` and `stories`. Before production, tighten this to:
+        // isAuthenticated() && request.auth.token.app_user_id == resource.data.sender_id
+        allow delete: if isValidDocId(chatId) && isValidDocId(messageId);
+      }
+    }
+
+    // Stories collection (real-time 24-hour stories across devices)
+    match /stories/{storyId} {
+      allow get: if isValidDocId(storyId);
+      allow list: if request.query.limit == null || request.query.limit <= 100;
+
+      allow create: if isValidDocId(storyId) &&
+                       isValidStoryPayload(request.resource.data);
+
+      allow update: if isValidDocId(storyId) &&
+                       isValidStoryUpdate(request.resource.data, resource.data);
+
+      allow delete: if isValidDocId(storyId);
+    }
+  }
+}
